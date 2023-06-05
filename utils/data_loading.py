@@ -26,6 +26,8 @@ def load_image(filename):
 def unique_mask_values(idx, mask_dir, mask_suffix):
     mask_file = list(mask_dir.glob(idx + mask_suffix + '.*'))[0]
     mask = np.asarray(load_image(mask_file))
+    # 载入的图片值有噪声, 让他大于128将较小的值过滤掉，顺便进行二值化
+    mask = (mask > 128).astype(np.int64) * 255
     if mask.ndim == 2:
         return np.unique(mask)
     elif mask.ndim == 3:
