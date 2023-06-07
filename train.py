@@ -19,14 +19,23 @@ from unet import UNet
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
 
+import re
+
+# 以下代码是测试时代码
+sys.path.append("/home/data/seg_impo")
+from tools.sim_loss import SimLoss
+
 dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
+# 息肉数据有噪声，需要二值化
+noisy_data = True
 
 
 def train_model(
         model,
         device,
+        resize_shape = None,
         epochs: int = 5,
         batch_size: int = 1,
         learning_rate: float = 1e-5,
@@ -34,6 +43,7 @@ def train_model(
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
         amp: bool = False,
+        use_sim_loss: bool = False,
         weight_decay: float = 1e-8,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
@@ -42,7 +52,7 @@ def train_model(
     try:
         dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
     except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+        dataset = BasicDataset(dir_img, dir_mask, img_scale, resize_shape=resize_shape, noisy_data=noisy_data)
 
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
@@ -51,6 +61,7 @@ def train_model(
 
     # 3. Create data loaders
     loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
+
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
@@ -76,9 +87,12 @@ def train_model(
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
     optimizer = optim.RMSprop(model.parameters(),
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=10, min_lr=1e-6)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
+    if(use_sim_loss):
+        criterion = SimLoss(model.n_classes, 1)
+    else:
+        criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
 
     # 5. Begin training
@@ -99,7 +113,18 @@ def train_model(
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
-                    if model.n_classes == 1:
+                    if(use_sim_loss):
+                        if(model.n_classes == 1):
+                            loss = criterion(masks_pred, true_masks.unsqueeze(1))
+                            loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
+                        else:
+                            loss = criterion(masks_pred, F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2))
+                            loss += dice_loss(
+                                F.softmax(masks_pred, dim=1).float(),
+                                F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
+                                multiclass=True
+                            )
+                    elif model.n_classes == 1:
                         loss = criterion(masks_pred.squeeze(1), true_masks.float())
                         loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
                     else:
@@ -127,7 +152,7 @@ def train_model(
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
 
                 # Evaluation round
-                division_step = (n_train // (5 * batch_size))
+                division_step = (n_train // (1 * batch_size))
                 if division_step > 0:
                     if global_step % division_step == 0:
                         histograms = {}
@@ -181,11 +206,25 @@ def get_args():
     parser.add_argument('--classes', '-c', type=int, default=1, help='Number of classes')
     parser.add_argument('--data', type=str, default='/home/data/seg_impo/data/train', help='data path')
 
+    # 是否要先进行resize
+    parser.add_argument('--resize-shape', type=str, default="", 
+                        help="resize before or not, if it is, --resize-shape height,width sample: --resize-shape 448,448",
+                        dest="resize_shape")
+    parser.add_argument('--use-sim-loss', action='store_true', default=False, help='is use sim_loss', dest='use_sim_loss')
+
+
     return parser.parse_args()
 
 
 if __name__ == '__main__':
     args = get_args()
+    if(args.resize_shape != ""):
+        pattern = r'^[0-9]+,[0-9]+$'
+        assert re.match(pattern, args.resize_shape), "resize_shape mast be like --resize-shape height,width"
+        resize_shape = tuple(map(int, args.resize_shape.split(',')))
+    else:
+        resize_shape = None
+
 
     dir_img = Path(args.data) / "images"
     dir_mask = Path(args.data) / "masks"
@@ -213,17 +252,18 @@ if __name__ == '__main__':
 
     model.to(device=device)
     train_model(
-            model=model,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.lr,
-            device=device,
-            img_scale=args.scale,
-            val_percent=args.val / 100,
-            amp=args.amp
-        )
+        model=model,
+        epochs=args.epochs,
+        resize_shape=resize_shape,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        device=device,
+        img_scale=args.scale,
+        val_percent=args.val / 100,
+        amp=args.amp,
+        use_sim_loss=args.use_sim_loss
+    )
     # try:
-        
     # except torch.cuda.OutOfMemoryError:
     #     logging.error('Detected OutOfMemoryError! '
     #                   'Enabling checkpointing to reduce memory usage, but this slows down training. '

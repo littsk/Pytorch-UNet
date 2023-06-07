@@ -23,11 +23,12 @@ def load_image(filename):
         return Image.open(filename)
 
 
-def unique_mask_values(idx, mask_dir, mask_suffix):
+def unique_mask_values(idx, mask_dir, mask_suffix, noisy_data=False):
     mask_file = list(mask_dir.glob(idx + mask_suffix + '.*'))[0]
     mask = np.asarray(load_image(mask_file))
     # 载入的图片值有噪声, 让他大于128将较小的值过滤掉，顺便进行二值化
-    mask = (mask > 128).astype(np.int64) * 255
+    if(noisy_data):
+        mask = (mask > 128).astype(np.int64) * 255
     if mask.ndim == 2:
         return np.unique(mask)
     elif mask.ndim == 3:
@@ -38,12 +39,13 @@ def unique_mask_values(idx, mask_dir, mask_suffix):
 
 
 class BasicDataset(Dataset):
-    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = ''):
+    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = '', resize_shape=None, noisy_data=False):
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
         assert 0 < scale <= 1, 'Scale must be between 0 and 1'
         self.scale = scale
         self.mask_suffix = mask_suffix
+        self.resize_shape = resize_shape
 
         self.ids = [splitext(file)[0] for file in listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
         if not self.ids:
@@ -53,7 +55,7 @@ class BasicDataset(Dataset):
         logging.info('Scanning mask files to determine unique values')
         with Pool() as p:
             unique = list(tqdm(
-                p.imap(partial(unique_mask_values, mask_dir=self.mask_dir, mask_suffix=self.mask_suffix), self.ids),
+                p.imap(partial(unique_mask_values, mask_dir=self.mask_dir, mask_suffix=self.mask_suffix, noisy_data=noisy_data), self.ids),
                 total=len(self.ids)
             ))
 
@@ -64,9 +66,12 @@ class BasicDataset(Dataset):
         return len(self.ids)
 
     @staticmethod
-    def preprocess(mask_values, pil_img, scale, is_mask):
+    def preprocess(mask_values, pil_img, scale, is_mask, resize_shape=None):
         w, h = pil_img.size
-        newW, newH = int(scale * w), int(scale * h)
+        if(resize_shape is not None):
+            newH, newW = resize_shape[0], resize_shape[1]
+        else:
+            newW, newH = int(scale * w), int(scale * h)
         assert newW > 0 and newH > 0, 'Scale is too small, resized images would have no pixel'
         pil_img = pil_img.resize((newW, newH), resample=Image.NEAREST if is_mask else Image.BICUBIC)
         img = np.asarray(pil_img)
@@ -105,8 +110,8 @@ class BasicDataset(Dataset):
         assert img.size == mask.size, \
             f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
 
-        img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
-        mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
+        img = self.preprocess(self.mask_values, img, self.scale, is_mask=False, resize_shape=self.resize_shape)
+        mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True, resize_shape=self.resize_shape)
 
         return {
             'image': torch.as_tensor(img.copy()).float().contiguous(),

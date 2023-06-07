@@ -12,13 +12,16 @@ from utils.data_loading import BasicDataset
 from unet import UNet
 from utils.utils import plot_img_and_mask
 
+import re
+
 def predict_img(net,
                 full_img,
                 device,
                 scale_factor=1,
-                out_threshold=0.5):
+                out_threshold=0.5,
+                resize_shape=None):
     net.eval()
-    img = torch.from_numpy(BasicDataset.preprocess(None, full_img, scale_factor, is_mask=False))
+    img = torch.from_numpy(BasicDataset.preprocess(None, full_img, scale_factor, is_mask=False, resize_shape=resize_shape))
     img = img.unsqueeze(0)
     img = img.to(device=device, dtype=torch.float32)
 
@@ -47,7 +50,12 @@ def get_args():
     parser.add_argument('--scale', '-s', type=float, default=0.5,
                         help='Scale factor for the input images')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--classes', '-c', type=int, default=1, help='Number of classes')
+
+    # 是否要先进行resize
+    parser.add_argument('--resize-shape', type=str, default="", 
+                        help="resize before or not, if it is, --resize-shape height,width sample: --resize-shape 448,448",
+                        dest="resize_shape")
     
     return parser.parse_args()
 
@@ -80,6 +88,13 @@ if __name__ == '__main__':
     args = get_args()
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
+    if(args.resize_shape != ""):
+        pattern = r'^[0-9]+,[0-9]+$'
+        assert re.match(pattern, args.resize_shape), "resize_shape mast be like --resize-shape height,width"
+        resize_shape = tuple(map(int, args.resize_shape.split(',')))
+    else:
+        resize_shape = None
+
     in_files = args.input
     out_files = get_output_filenames(args)
 
@@ -104,7 +119,8 @@ if __name__ == '__main__':
                            full_img=img,
                            scale_factor=args.scale,
                            out_threshold=args.mask_threshold,
-                           device=device)
+                           device=device,
+                           resize_shape=resize_shape)
 
         if not args.no_save:
             out_filename = out_files[i]
